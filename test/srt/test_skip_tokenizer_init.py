@@ -1,14 +1,15 @@
 """
 python3 -m unittest test_skip_tokenizer_init.TestSkipTokenizerInit.test_parallel_sample
 """
+
 import json
 import unittest
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
 class TestSkipTokenizerInit(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -29,7 +30,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
         max_new_tokens = 32

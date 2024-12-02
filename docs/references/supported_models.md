@@ -28,6 +28,7 @@
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
+- Phi-3-Small
 
 ## Embedding Models
 
@@ -40,7 +41,10 @@
 
 - LlamaForSequenceClassification
   - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 --is-embedding`
-
+- Gemma2ForSequenceClassification
+  - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Gemma-2-27B-v0.2 --is-embedding`
+- InternLM2ForRewardModel
+  - `python -m sglang.launch_server --model-path internlm/internlm2-7b-reward --is-embedding --trust-remote-code`
 
 ## How to Support a New Model
 
@@ -55,7 +59,7 @@ For interactive debugging, you can compare the outputs of huggingface/transforme
 The following two commands should give the same text output and very similar prefill logits.
 
 - Get the reference output by `python3 scripts/playground/reference_hf.py --model [new model]`
-- Get the SGLang output by `python3 -m sglang.bench_latency --correct --model [new model]`
+- Get the SGLang output by `python3 -m sglang.bench_one_batch --correct --model [new model]`
 
 #### Add the model to the test suite
 To make sure the new model is well maintained in the future, it is better to add it to the test suite.
