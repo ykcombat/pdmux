@@ -42,7 +42,7 @@ from sglang.srt.constrained.grammar import Grammar
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -488,6 +488,12 @@ class ScheduleBatch:
     # device
     device: str = "cuda"
 
+    # split prefill
+    split_index: int = 0
+    split_forward_batch: ForwardBatch = None
+    split_prefill_finished: bool = False
+    split_prefill_seqlen: int = 0
+
     @classmethod
     def init_new(
         cls,
@@ -693,6 +699,9 @@ class ScheduleBatch:
             self.model_config.vocab_size,
             global_server_args_dict["disable_penalizer"],
         )
+    
+    def prepare_for_split_prefill(self):
+        self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED

@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    SplitPrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -74,6 +75,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
+
+MAX_SPLIT_PREFILL_SEQLEN = 8192
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,7 @@ class Scheduler:
         self.cur_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time() # time of last stats for every iter
         self.last_log_tic = time.time() # time of last log for print decode log
@@ -321,6 +325,34 @@ class Scheduler:
 
         kill_parent_process()
 
+
+    @torch.inference_mode()
+    def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        result_queue = deque()
+
+        self.last_batch = None
+        self.running_batch = None
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            if batch:
+                result = self.run_batch(batch)
+                result_queue.append((batch.copy(), result))
+
+            if self.last_batch:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            elif batch is None:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+            self.last_batch = batch
+
     @torch.inference_mode()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
@@ -358,32 +390,69 @@ class Scheduler:
 
             self.last_batch = batch
 
+    
     @torch.inference_mode()
-    def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        result_queue = deque()
-
-        self.last_batch = None
-        self.running_batch = None
+    def event_loop_pdmux(self):
+        """A scheduler loop for pd multiplexing."""
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            if batch:
-                result = self.run_batch(batch)
-                result_queue.append((batch.copy(), result))
+            self.update_split_prefill_batch()
+            self.update_running_batch()
 
-            if self.last_batch:
-                tmp_batch, tmp_result = result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
+            if not self.running_batch and not self.split_prefill_batch:
                 self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.new_token_ratio = global_config.init_new_token_ratio
+                continue
 
-            self.last_batch = batch
+            # process decode batch
+            if self.running_batch and not self.running_batch.is_empty():
+                result = self.run_batch(self.running_batch)
+                self.process_batch_result(self.running_batch, result)
+
+            # process prefill batch
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                for _ in range(max(1, MAX_SPLIT_PREFILL_SEQLEN // self.split_prefill_batch.split_prefill_seqlen)):
+                    result = self.run_batch(self.split_prefill_batch)
+                    if self.split_prefill_batch.split_prefill_finished:
+                        self.process_batch_result(self.split_prefill_batch, result)
+                        break
+
+    @torch.inference_mode()
+    def event_loop_pdmux_overlap(self):
+        decode_result_queue = deque()
+        prefill_result_queue = deque()
+        self.last_prefill_batch = None
+        self.last_decode_batch = None
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            self.update_split_prefill_batch()
+            self.update_running_batch()
+
+            if self.split_prefill_batch is None and self.running_batch is None and self.last_prefill_batch is None and self.last_decode_batch is None:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+                continue
+            if self.running_batch and not self.running_batch.is_empty():
+                decode_result = self.run_batch(self.running_batch)
+                decode_result_queue.append((self.running_batch.copy(), decode_result))
+            if self.last_decode_batch and not self.last_decode_batch.is_empty():
+                tmp_batch, tmp_result = decode_result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                prefill_result = self.run_batch(self.split_prefill_batch)
+                if self.split_prefill_batch.split_prefill_finished:
+                    prefill_result_queue.append((self.split_prefill_batch.copy(), prefill_result))
+            if self.last_prefill_batch and not self.last_prefill_batch.is_empty():
+                tmp_batch, tmp_result = prefill_result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            self.last_prefill_batch = self.split_prefill_batch
+            self.last_decode_batch = self.running_batch
+
 
     def recv_requests(self):
         if self.tp_rank == 0:
@@ -537,7 +606,7 @@ class Scheduler:
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-    def check_memory(self):
+    def check_memory(self): 
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
@@ -745,14 +814,133 @@ class Scheduler:
             new_batch.decoding_reqs = None
 
         return new_batch
+    
+    def get_new_batch_split_prefill(self) -> Optional[ScheduleBatch]:
+        # Handle the cases where prefill is not allowed
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.current_inflight_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        if running_bs >= self.max_running_requests:
+            self.batch_is_full = True
+            return None
+
+        # Get priority queue
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy
+        num_mixed_running = running_bs if self.is_mixed_chunk else 0
+        adder = SplitPrefillAdder(
+            self.tree_cache,
+            self.running_batch,
+            self.new_token_ratio,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens
+        )
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                self.batch_is_full = True
+                break
+
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            res = adder.add_one_req(req)
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    self.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        # Print stats
+        if self.tp_rank == 0:
+            if isinstance(self.tree_cache, RadixCache):
+                self.tree_cache_metrics["total"] += (
+                    adder.log_input_tokens + adder.log_hit_tokens
+                ) / 10**9
+                self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
+                tree_cache_hit_rate = (
+                    self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+                )
+            else:
+                tree_cache_hit_rate = 0.0
+
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#queue-req: {len(self.waiting_queue)}"
+                )
+            else:
+                logger.info(
+                    f"Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue)}"
+                )
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+        )
+        new_batch.prepare_for_extend()
+        new_batch.prepare_for_split_prefill()
+        new_batch.split_prefill_seqlen = adder.log_input_tokens
+
+        new_batch.decoding_reqs = None
+
+        return new_batch
+    
+    def update_split_prefill_batch(self):
+        
+        if self.split_prefill_batch and not self.split_prefill_batch.is_empty() and self.split_prefill_batch.split_prefill_finished:
+            # merge prefill batch to decode batch
+            if self.running_batch:
+                self.running_batch.merge_batch(self.split_prefill_batch)
+            else:
+                self.running_batch = self.split_prefill_batch
+            self.split_prefill_batch = None
+        # add new request
+        if not self.split_prefill_batch or self.split_prefill_batch.is_empty():
+            batch = self.get_new_batch_split_prefill()
+            if batch and not batch.is_empty():
+                self.split_prefill_batch = batch
 
     def update_running_batch(self):
         """Update the current running decoding batch."""
         global test_retract
         batch = self.running_batch
 
-        batch.filter_batch()
-        if batch.is_empty():
+        if batch:
+            batch.filter_batch()
+        if not batch or batch.is_empty():
             self.running_batch = None
             return
 
@@ -791,8 +979,12 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch = batch.get_model_worker_batch()
+            if batch.forward_mode.is_split_prefill():
+                logits_output, next_token_ids = self.tp_worker.forward_batch_split_prefill(
+                    batch
+                )
+            elif batch.forward_mode.is_decode()  or batch.extend_num_tokens != 0:
                 batch.mark_reqs_started()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
@@ -1296,10 +1488,16 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send("ready")
-        if server_args.enable_overlap_schedule:
-            scheduler.event_loop_overlap()
+        if server_args.pd_policy == "pdmux":
+            if server_args.enable_overlap_schedule:
+                scheduler.event_loop_pdmux_overlap()
+            else:
+                scheduler.event_loop_pdmux()
         else:
-            scheduler.event_loop_normal()
+            if server_args.enable_overlap_schedule:
+                scheduler.event_loop_overlap() 
+            else:
+                scheduler.event_loop_normal()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)

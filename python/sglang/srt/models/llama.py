@@ -45,6 +45,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+import time
+
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -272,7 +274,7 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ):
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -288,6 +290,42 @@ class LlamaModel(nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+    
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     input_embeds: torch.Tensor = None,
+    # ):
+    #     dur = torch.empty(35)
+    #     if input_embeds is None:
+    #         tic = time.time()
+    #         hidden_states = self.embed_tokens(input_ids)
+    #         torch.cuda.synchronize()
+    #         ted = time.time()
+    #         dur[0] = (ted-tic) * 1000
+    #     else:
+    #         hidden_states = input_embeds
+    #     residual = None
+    #     for i in range(len(self.layers)):
+    #         layer = self.layers[i]
+    #         tic = time.time()
+    #         hidden_states, residual = layer(
+    #             positions,
+    #             hidden_states,
+    #             forward_batch,
+    #             residual,
+    #         )
+    #         torch.cuda.synchronize()
+    #         ted = time.time()
+    #         dur[i + 1] = (ted-tic) * 1000
+    #     tic = time.time()
+    #     hidden_states, _ = self.norm(hidden_states, residual)
+    #     torch.cuda.synchronize()
+    #     ted = time.time()
+    #     dur[33] = (ted-tic) * 1000
+    #     return hidden_states, dur
 
 
 class LlamaForCausalLM(nn.Module):
@@ -306,6 +344,24 @@ class LlamaForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+    # @torch.no_grad()
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     input_embeds: torch.Tensor = None,
+    # ):
+    #     hidden_states, dur = self.model(input_ids, positions, forward_batch, input_embeds)
+    #     tic = time.time()
+    #     res = self.logits_processor(
+    #         input_ids, hidden_states, self.lm_head.weight, forward_batch
+    #     )
+    #     torch.cuda.synchronize()
+    #     ted = time.time()
+    #     dur[34] = (ted-tic) * 1000
+    #     return res,dur
+    
     @torch.no_grad()
     def forward(
         self,
@@ -322,6 +378,46 @@ class LlamaForCausalLM(nn.Module):
             )
         else:
             return self.pooler(hidden_states, forward_batch)
+
+    
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_index: int,
+        input_embeds: torch.Tensor = None
+    ) -> Optional[LogitsProcessorOutput]:
+        # embed
+        if split_index == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds            
+            return
+        # decoder layer
+        if split_index < self.config.num_hidden_layers + 1:
+            layer = self.model.layers[split_index - 1]
+            hidden_states, residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+            forward_batch.hidden_states = hidden_states
+            forward_batch.residual = residual
+            return
+        # norm
+        if split_index == self.config.num_hidden_layers + 1:
+            hidden_states, _ = self.model.norm(forward_batch.hidden_states, forward_batch.residual)
+            forward_batch.hidden_states = hidden_states
+            return
+        # logits process
+        return self.logits_processor(
+            input_ids, forward_batch.hidden_states, self.lm_head.weight, forward_batch
+        )
+
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim

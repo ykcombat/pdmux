@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
+import csv
+
 import aiohttp
 import numpy as np
 import requests
@@ -459,7 +461,7 @@ class BenchmarkMetrics:
     median_e2e_latency_ms: float
 
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_URL = "https://www.modelscope.cn/datasets/gliang1001/ShareGPT_V3_unfiltered_cleaned_split/resolve/master/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -494,6 +496,15 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
             bar.update(len(chunk))
 
     return filename
+
+def sample_synthesis_requests(
+        num_requests: int,
+        input_length: int) -> List[Tuple[str, int, int]]:
+    sample_results: List[Tuple[str, int, int]] = []
+    for _ in range(num_requests):
+        sample_results.append(("abcdefghijklmn"*input_length,input_length, 32))
+    return sample_results
+    
 
 
 def sample_sharegpt_requests(
@@ -680,6 +691,15 @@ def calculate_metrics(
         else:
             output_lens.append(0)
             retokenized_output_lens.append(0)
+    
+    # with open(f"/home/ykchen/sglang/res/scheduler_metrics.csv", "a+") as f:
+    #     writer = csv.writer(f)
+    #     row = ['%.2f'%(np.mean(ttfts or 0)* 1000), '%.2f'%(np.percentile(ttfts or 0, 99) * 1000), '%.2f'%(np.mean(tpots or 0) * 1000), '%.2f'%(np.percentile(tpots or 0, 99) * 1000), '%.2f'%(np.mean(e2e_latencies) * 1000)]
+    #     for i in range(len(ttfts)):
+    #         row.append('%.2f'%(ttfts[i] * 1000))
+    #     for i in range(len(tpots)):
+    #         row.append('%.2f'%(tpots[i] * 1000))
+    #     writer.writerow(row)
 
     if completed == 0:
         warnings.warn(
@@ -751,6 +771,28 @@ async def benchmark(
         print("Initial test run completed. Starting main benchmark run...")
 
     time.sleep(1.5)
+
+    print("warm up ...")
+    tasks: List[asyncio.Task] = []
+    async for request in get_request(input_requests, request_rate):
+        prompt, prompt_len, output_len = request
+        request_func_input = RequestFuncInput(
+            model=model_id,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            extra_request_body=extra_request_body,
+        )
+        tasks.append(
+            asyncio.create_task(
+                request_func(request_func_input=request_func_input)
+            )
+        )
+    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    print("warm up done ...")
+    time.sleep(1.5)
+
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1048,6 +1090,10 @@ def run_benchmark(args_: argparse.Namespace):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
         )
+    elif args.dataset_name == "synthesis":
+        input_requests = sample_synthesis_requests(
+            num_requests=args.num_prompts, input_length=512
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1121,7 +1167,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "synthesis"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(

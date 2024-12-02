@@ -1,3 +1,14 @@
+# import torch
+# batch_size = 4
+# hidden_size = 4096
+# intermediate_size = 14336
+
+# input = torch.randn(batch_size,hidden_size).cuda()
+# weight = torch.randn(intermediate_size,hidden_size).cuda()
+
+# while True:
+#     torch.nn.functional.linear(input,weight)
+
 """
 Benchmark the latency of running a single static batch.
 This script does not launch a server and uses the low-level APIs.
@@ -92,8 +103,6 @@ class BenchArgs:
     )
     graph_filename: str = "out.png"
     mps:Tuple[int] = (100,)
-    prefill_mode:str = "prefill"
-    record_split: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -120,10 +129,6 @@ class BenchArgs:
         parser.add_argument(
             "--graph-filename", type=str, default=BenchArgs.graph_filename
         )
-        parser.add_argument(
-            "--prefill-mode", type=str, default=BenchArgs.prefill_mode
-        )
-        parser.add_argument("--record-split", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -140,9 +145,9 @@ def load_model(server_args, port_args, tp_rank):
 
     model_config = ModelConfig(
         server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
+        server_args.trust_remote_code,
         context_length=server_args.context_length,
-        model_override_args=server_args.json_model_override_args,
+        model_override_args=json.loads(server_args.json_model_override_args),
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -243,48 +248,7 @@ def extend(reqs, model_runner):
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, dur = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits, batch, dur
-
-
-@torch.inference_mode()
-def split_prefill_forward_record_split(reqs, model_runner):
-    dur = torch.empty(35)
-    batch = ScheduleBatch.init_new(
-        reqs=reqs,
-        req_to_token_pool=model_runner.req_to_token_pool,
-        token_to_kv_pool=model_runner.token_to_kv_pool,
-        tree_cache=None,
-        model_config=model_runner.model_config,
-    )
-    batch.prepare_for_extend()
-    batch.prepare_for_split_prefill()
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    for split_idx in range(35):
-        tic = time.time()  
-        logits_output = model_runner.forward(forward_batch)
-        torch.cuda.synchronize()
-        ted = time.time()
-        dur[split_idx] = (ted-tic) * 1000
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits, batch, dur
-
-@torch.inference_mode()
-def split_prefill_forward(reqs, model_runner):
-    batch = ScheduleBatch.init_new(
-        reqs=reqs,
-        req_to_token_pool=model_runner.req_to_token_pool,
-        token_to_kv_pool=model_runner.token_to_kv_pool,
-        tree_cache=None,
-        model_config=model_runner.model_config,
-    )
-    batch.prepare_for_extend()
-    batch.prepare_for_split_prefill()
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    for _ in range(35):
+    while True:
         logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -296,7 +260,7 @@ def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output,_ = model_runner.forward(forward_batch)
+    logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
@@ -353,7 +317,7 @@ def synchronize(device):
 
 
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps, split_prefill, record_split
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps
 ):
     print("===============================")
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -379,13 +343,7 @@ def latency_test_run_once(
     # Prefill
     synchronize(device)
     tic = time.time()
-    if split_prefill:
-        if record_split:
-            next_token_ids, _, batch, dur = split_prefill_forward_record_split(reqs, model_runner)
-        else:
-            next_token_ids, _, batch = split_prefill_forward(reqs, model_runner)
-    else:
-        next_token_ids, _, batch, dur = extend(reqs, model_runner)
+    next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
@@ -431,19 +389,10 @@ def latency_test_run_once(
 
     mem = torch.cuda.max_memory_allocated()
 
-    if tp_rank == 0 and not warm_up and not record_split:
-        with open(f"/home/ykchen/sglang/res/split_prefill.csv","a+") as f:
+    if tp_rank == 0 and not warm_up:
+        with open(f"/home/ykchen/sglang/res/breakdown_mps_colocation_{mps}.csv","a+") as f:
             writer = csv.writer(f)
-            # writer.writerow([tp_size, batch_size, input_len, '%.2f'%(prefill_latency * 1000), '%.2f'%(prefill_latency/32*1000), '%.2f'%(med_decode_latency*1000), mem])
-            writer.writerow([batch_size, input_len, '%.2f'%(prefill_latency * 1000)])
-
-    if tp_rank == 0 and not warm_up and record_split:
-        with open(f"/home/ykchen/sglang/res/prefill_split_record.csv","a+") as f:
-            writer = csv.writer(f)
-            row = [split_prefill, batch_size, input_len]
-            for i in range(len(dur)):
-                row.append('%.2f'%(dur[i]))
-            writer.writerow(row)
+            writer.writerow([tp_size, batch_size, input_len, '%.2f'%(prefill_latency * 1000), '%.2f'%(prefill_latency/32*1000), '%.2f'%(med_decode_latency*1000), mem])
 
 
     return measurement_results
@@ -480,9 +429,7 @@ def latency_test(
         server_args.tp_size,
         tp_rank,
         True,
-        bench_args.mps[0],
-        bench_args.prefill_mode == "split",
-        bench_args.record_split
+        bench_args.mps[0]
     )
     rank_print("Benchmark ...")
 
@@ -504,9 +451,7 @@ def latency_test(
             server_args.tp_size,
             tp_rank,
             False,
-            bench_args.mps[0],
-            bench_args.prefill_mode == "split",
-            bench_args.record_split
+            bench_args.mps[0]
         )
         if ret is not None:
             result_list.append(ret)
@@ -640,4 +585,4 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process()
+        kill_child_process(os.getpid(), including_parent=False)
