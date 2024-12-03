@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Request scheduler policy"""
 
 import os
@@ -30,7 +28,9 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 
 class SchedulePolicy:
@@ -43,9 +43,15 @@ class SchedulePolicy:
         self.tree_cache = tree_cache
 
     def calc_priority(self, waiting_queue: List[Req]):
+        if len(waiting_queue) > 128 and self.policy == "lpm":
+            # Turn off the expensive prefix matching and sorting when the #queue is large.
+            policy = "fcfs"
+        else:
+            policy = self.policy
+
         # Compute matched prefix length
         prefix_computed = False
-        if self.policy == "lpm" or self.policy == "dfs-weight":
+        if policy == "lpm" or policy == "dfs-weight":
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
@@ -54,18 +60,18 @@ class SchedulePolicy:
 
             prefix_computed = True
 
-        if self.policy == "lpm":
+        if policy == "lpm":
             # Longest Prefix Match
             waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
-        elif self.policy == "fcfs":
+        elif policy == "fcfs":
             # first come first serve
             pass
-        elif self.policy == "lof":
+        elif policy == "lof":
             # longest output first
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
-        elif self.policy == "random":
+        elif policy == "random":
             random.shuffle(waiting_queue)
-        elif self.policy == "dfs-weight":
+        elif policy == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
             for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
@@ -83,7 +89,7 @@ class SchedulePolicy:
                 waiting_queue,
             )
         else:
-            raise ValueError(f"Unknown schedule_policy: {self.policy}")
+            raise ValueError(f"Unknown schedule_policy: {policy=}")
 
         return prefix_computed
 
@@ -137,7 +143,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
-        self.new_inflight_req = None
+        self.new_being_chunked_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
 
@@ -147,7 +153,7 @@ class PrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
@@ -177,7 +183,7 @@ class PrefillAdder:
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
-    def add_inflight_req(self, req: Req):
+    def add_being_chunked_req(self, req: Req):
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -187,7 +193,7 @@ class PrefillAdder:
             len(req.prefix_indices),
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
                 if not truncated
                 else 0
             ),
@@ -259,15 +265,18 @@ class PrefillAdder:
             self._prefill_one_req(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
             )
         else:
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            if trunc_len == 0:
+                return AddReqResult.OTHER
+
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_inflight_req = req
+            self.new_being_chunked_req = req
             self._prefill_one_req(0, trunc_len, 0)
 
         return self.budget_state()
@@ -277,7 +286,7 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
@@ -295,7 +304,11 @@ class PrefillAdder:
             if (
                 self.rem_chunk_tokens is None
                 or input_tokens <= self.rem_chunk_tokens
-                or (req.return_logprob and req.normalized_prompt_logprob is None)
+                or (
+                    req.return_logprob
+                    and req.normalized_prompt_logprob is None
+                    and req.logprob_start_len != len(req.origin_input_ids) - 1
+                )
             ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)
@@ -303,7 +316,10 @@ class PrefillAdder:
                 self._prefill_one_req(
                     prefix_len,
                     input_tokens,
-                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                    min(
+                        req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                    ),
                 )
             else:
                 # Chunked prefill
@@ -314,7 +330,7 @@ class PrefillAdder:
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
                 self.can_run_list.append(req)
-                self.new_inflight_req = req
+                self.new_being_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
 
@@ -349,7 +365,7 @@ class SplitPrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
@@ -441,7 +457,7 @@ class SplitPrefillAdder:
         self._prefill_one_req(
             0,
             req.extend_input_len,
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
         )
         return self.budget_state()
 
@@ -450,7 +466,7 @@ class SplitPrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
@@ -470,7 +486,7 @@ class SplitPrefillAdder:
             self._prefill_one_req(
                 prefix_len,
                 input_tokens,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
             )
 
         return self.budget_state()

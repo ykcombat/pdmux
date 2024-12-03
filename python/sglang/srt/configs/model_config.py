@@ -1,26 +1,28 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+import json
 import logging
-import os
 from enum import IntEnum, auto
-from typing import Optional
+from typing import List, Optional, Union
 
+import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -33,31 +35,41 @@ class AttentionArch(IntEnum):
 class ModelConfig:
     def __init__(
         self,
-        path: str,
+        model_path: str,
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
         model_override_args: Optional[dict] = None,
+        is_embedding: Optional[bool] = None,
+        dtype: str = "auto",
+        quantization: Optional[str] = None,
     ) -> None:
-        self.path = path
-        self.trust_remote_code = trust_remote_code
+        self.model_path = model_path
         self.revision = revision
-        self.model_override_args = model_override_args
+        self.quantization = quantization
+        # Parse args
+        self.model_override_args = json.loads(model_override_args)
         self.hf_config = get_config(
-            self.path,
-            trust_remote_code,
-            revision,
-            model_override_args=model_override_args,
+            model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=self.model_override_args,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        derived_context_len = get_context_length(self.hf_text_config)
-        allow_long_context = os.environ.get(
-            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", None
-        )
 
+        # Check model type
+        self.is_generation = is_generation_model(
+            self.hf_config.architectures, is_embedding
+        )
+        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+
+        # Derive context length
+        derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if allow_long_context:
+                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
@@ -81,7 +93,7 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
-        # FIXME: temporary special judge for deepseek v2 MLA architecture
+        # FIXME: temporary special judge for MLA architecture
         if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -112,7 +124,7 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
-        self.is_encoder_decoder = self.hf_config.model_type in ["mllama"]
+        self._verify_quantization()
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -163,7 +175,6 @@ class ModelConfig:
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
 
-    # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L328
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
         total_num_kv_heads = self.get_total_num_kv_heads()
@@ -172,6 +183,86 @@ class ModelConfig:
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
+
+    # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+    def _parse_quant_hf_config(self):
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            # compressed-tensors uses a "compression_config" key
+            quant_cfg = getattr(self.hf_config, "compression_config", None)
+        return quant_cfg
+
+    # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+    def _verify_quantization(self) -> None:
+        supported_quantization = [*QUANTIZATION_METHODS]
+        rocm_supported_quantization = [
+            "awq",
+            "gptq",
+            "fp8",
+            "compressed_tensors",
+            "compressed-tensors",
+            "fbgemm_fp8",
+        ]
+        optimized_quantization_methods = [
+            "fp8",
+            "marlin",
+            "modelopt",
+            "gptq_marlin_24",
+            "gptq_marlin",
+            "awq_marlin",
+            "fbgemm_fp8",
+            "compressed_tensors",
+            "compressed-tensors",
+            "experts_int8",
+        ]
+        if self.quantization is not None:
+            self.quantization = self.quantization.lower()
+
+        # Parse quantization method from the HF model config, if available.
+        quant_cfg = self._parse_quant_hf_config()
+
+        if quant_cfg is not None:
+            quant_method = quant_cfg.get("quant_method", "").lower()
+
+            # Detect which checkpoint is it
+            for _, method in QUANTIZATION_METHODS.items():
+                quantization_override = method.override_quantization_method(
+                    quant_cfg, self.quantization
+                )
+                if quantization_override:
+                    quant_method = quantization_override
+                    self.quantization = quantization_override
+                    break
+
+            # Verify quantization configurations.
+            if self.quantization is None:
+                self.quantization = quant_method
+            elif self.quantization != quant_method:
+                raise ValueError(
+                    "Quantization method specified in the model config "
+                    f"({quant_method}) does not match the quantization "
+                    f"method specified in the `quantization` argument "
+                    f"({self.quantization})."
+                )
+
+        if self.quantization is not None:
+            if self.quantization not in supported_quantization:
+                raise ValueError(
+                    f"Unknown quantization method: {self.quantization}. Must "
+                    f"be one of {supported_quantization}."
+                )
+            if is_hip() and self.quantization not in rocm_supported_quantization:
+                raise ValueError(
+                    f"{self.quantization} quantization is currently not "
+                    f"supported in ROCm."
+                )
+            if self.quantization not in optimized_quantization_methods:
+                logger.warning(
+                    "%s quantization is not fully "
+                    "optimized yet. The speed can be slower than "
+                    "non-quantized models.",
+                    self.quantization,
+                )
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -182,6 +273,9 @@ def get_hf_text_config(config: PretrainedConfig):
     if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
         # We support non-hf version of llava models, so we do not want to
         # read the wrong values from the unused default text_config.
+        # NOTE(HandH1998): We set `torch_dtype` of config to `torch.float16` for the weights, as
+        # `torch.float16` is default used for image features in `python/sglang/srt/models/llava.py`.
+        setattr(config, "torch_dtype", torch.float16)
         return config
 
     if hasattr(config, "text_config"):
@@ -192,3 +286,102 @@ def get_hf_text_config(config: PretrainedConfig):
         return config.text_config
     else:
         return config
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+_STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.float16,
+    "float16": torch.float16,
+    "float": torch.float32,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+def _get_and_verify_dtype(
+    config: PretrainedConfig,
+    dtype: Union[str, torch.dtype],
+) -> torch.dtype:
+    # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
+    # because config.torch_dtype can be None.
+    config_dtype = getattr(config, "torch_dtype", None)
+    if config_dtype is None:
+        config_dtype = torch.float32
+
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "auto":
+            if config_dtype == torch.float32:
+                if config.model_type == "gemma2":
+                    logger.info(
+                        "For Gemma 2, we downcast float32 to bfloat16 instead "
+                        "of float16 by default. Please specify `dtype` if you "
+                        "want to use float16."
+                    )
+                    torch_dtype = torch.bfloat16
+                else:
+                    # Following the common practice, we use float16 for float32
+                    # models.
+                    torch_dtype = torch.float16
+            else:
+                torch_dtype = config_dtype
+        else:
+            if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
+                raise ValueError(f"Unknown dtype: {dtype}")
+            torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
+    elif isinstance(dtype, torch.dtype):
+        torch_dtype = dtype
+    else:
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    # Verify the dtype.
+    if torch_dtype != config_dtype:
+        if torch_dtype == torch.float32:
+            # Upcasting to float32 is allowed.
+            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            pass
+        elif config_dtype == torch.float32:
+            # Downcasting from float32 to float16 or bfloat16 is allowed.
+            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            pass
+        else:
+            # Casting between float16 and bfloat16 is allowed with a warning.
+            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+
+    return torch_dtype
+
+
+def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architectue
+    # 2. check the `is_embedding` server args
+
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
+        or "InternLM2ForRewardModel" in model_architectures
+    ):
+        return False
+    else:
+        return not is_embedding
+
+
+def is_multimodal_model(model_architectures: List[str]):
+    if (
+        "LlavaLlamaForCausalLM" in model_architectures
+        or "LlavaQwenForCausalLM" in model_architectures
+        or "LlavaMistralForCausalLM" in model_architectures
+        or "LlavaVidForCausalLM" in model_architectures
+        or "MllamaForConditionalGeneration" in model_architectures
+        or "Qwen2VLForConditionalGeneration" in model_architectures
+    ):
+        return True
+    else:
+        return False
+
+
+def is_encoder_decoder_model(model_architectures: List[str]):
+    return "MllamaForConditionalGeneration" in model_architectures

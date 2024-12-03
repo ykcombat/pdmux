@@ -3,10 +3,10 @@ from typing import Iterable, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
 
 
@@ -15,7 +15,6 @@ class LlamaEmbeddingModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config=None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.model = LlamaModel(config, quant_config=quant_config)
@@ -36,9 +35,7 @@ class LlamaEmbeddingModel(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -49,7 +46,7 @@ class LlamaEmbeddingModel(nn.Module):
         ]
         params_dict = dict(self.model.named_parameters())
 
-        def load_weights_per_param(name, loaded_weight):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 return
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -77,12 +74,6 @@ class LlamaEmbeddingModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
-            load_weights_per_param(name, loaded_weight)
 
 
 class MistralModel(LlamaEmbeddingModel):

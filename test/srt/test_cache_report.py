@@ -1,13 +1,12 @@
 import asyncio
-import json
 import unittest
 
 import openai
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
 class TestCacheReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.min_cached = 5
         cls.process = popen_launch_server(
@@ -45,7 +44,7 @@ class TestCacheReport(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_process_tree(cls.process.pid)
 
     def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
         response = requests.post(
