@@ -907,6 +907,10 @@ def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
+def set_tp_group(tp_group: GroupCoordinator):
+    global _TP
+    _TP = tp_group
+
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group

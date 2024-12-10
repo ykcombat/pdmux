@@ -21,10 +21,13 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from vllm.distributed import (
+    set_tp_group,
     get_tp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    init_model_parallel_group
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
 
@@ -35,7 +38,7 @@ from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttn
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput    
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -203,7 +206,8 @@ class PDMuxModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
-        self.tp_group = get_tp_group()
+        self.decode_tp_group = get_tp_group()
+        self.prefill_tp_group = init_model_parallel_group([[self.tp_rank]], self.tp_rank, dist.get_backend(get_world_group().device_group),use_message_queue_broadcaster=True)
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
@@ -236,13 +240,14 @@ class PDMuxModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
-            load_way="entire_model"
         )
+        set_tp_group(self.prefill_tp_group)
         prefill_model_loader = EntireModelLoader(load_config=self.load_config)
         self.prefill_model = prefill_model_loader.load_model(
             model_config=self.model_config,
             device_config=DeviceConfig(self.device),
         )
+        set_tp_group(self.decode_tp_group)
         decode_model_loader = PDMuxDecodeModelLoader(load_config=self.load_config)
         self.decode_model = decode_model_loader.load_model(
             model_config=self.model_config,
