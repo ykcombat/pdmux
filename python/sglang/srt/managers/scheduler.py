@@ -424,11 +424,12 @@ class Scheduler:
             if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
                 for _ in range(max(1, MAX_SPLIT_PREFILL_SEQLEN // self.split_prefill_batch.split_prefill_seqlen)):
                     result = self.run_batch(self.split_prefill_batch)
+                    self.split_prefill_batch.split_index = self.split_prefill_batch.split_index + 1
                     if self.split_prefill_batch.split_prefill_finished:
                         self.process_batch_result(self.split_prefill_batch, result)
                         break
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def event_loop_pdmux_overlap(self):
         decode_result_queue = deque()
         prefill_result_queue = deque()
@@ -438,28 +439,56 @@ class Scheduler:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            self.update_split_prefill_batch()
-            self.update_running_batch(self.running_batch)
+            if not self.split_prefill_batch or self.split_prefill_batch.is_empty():
+                batch = self.get_new_batch_split_prefill()
+                if batch and not batch.is_empty():
+                    self.split_prefill_batch = batch
+            self.running_batch = self.update_running_batch(self.running_batch)
 
             if self.split_prefill_batch is None and self.running_batch is None and self.last_prefill_batch is None and self.last_decode_batch is None:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
                 continue
+            #decode
             if self.running_batch and not self.running_batch.is_empty():
                 decode_result = self.run_batch(self.running_batch)
                 decode_result_queue.append((self.running_batch.copy(), decode_result))
-            if self.last_decode_batch and not self.last_decode_batch.is_empty():
+            #prefill
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                forward_times = max(1, MAX_SPLIT_PREFILL_SEQLEN // self.split_prefill_batch.split_prefill_seqlen)
+                forward_times = min(forward_times, self.split_prefill_batch.split_max_index - self.split_prefill_batch.split_index)
+                prefill_result = self.run_multiple_split_batch(self.split_prefill_batch, forward_times)
+                if self.split_prefill_batch.split_index == self.split_prefill_batch.split_max_index:
+                    prefill_result_queue.append((self.split_prefill_batch.copy(), prefill_result))
+            if self.last_prefill_batch is None and self.last_decode_batch is None:
+                # A dummy first batch to start the pipeline for overlap scheduler.
+                # It is now used for triggering the sampling_info_done event.
+                tmp_batch = ScheduleBatch(
+                    reqs=None,
+                    forward_mode=ForwardMode.DUMMY_FIRST,
+                    next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                )
+                self.process_batch_result(tmp_batch, None)
+            #process decode result
+            if self.last_decode_batch:
                 tmp_batch, tmp_result = decode_result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
-                prefill_result = self.run_batch(self.split_prefill_batch)
-                if self.split_prefill_batch.split_prefill_finished:
-                    prefill_result_queue.append((self.split_prefill_batch.copy(), prefill_result))
-            if self.last_prefill_batch and not self.last_prefill_batch.is_empty():
+            self.last_decode_batch = self.running_batch
+            #process prefill result
+            if self.last_prefill_batch:
                 tmp_batch, tmp_result = prefill_result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-            self.last_prefill_batch = self.split_prefill_batch
-            self.last_decode_batch = self.running_batch
+                # merge prefill batch to decode batch
+                if self.running_batch:
+                    self.running_batch.merge_batch(self.last_prefill_batch)
+                else:
+                    self.running_batch = self.last_prefill_batch
+            if self.split_prefill_batch and self.split_prefill_batch.split_index == self.split_prefill_batch.split_max_index:
+                self.last_prefill_batch = self.split_prefill_batch
+                self.split_prefill_batch = None
+            else:
+                self.last_prefill_batch = None
+
 
             
     @torch.no_grad()
@@ -1180,6 +1209,15 @@ class Scheduler:
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = embeddings, model_worker_batch.bid
         return ret
+    
+    # only for overlap pdmux scheduler
+    def run_multiple_split_batch(self, batch: ScheduleBatch, forward_times=1):
+        if not batch.forward_mode.is_split_prefill():
+            return
+        logits_output, next_token_ids = self.tp_worker.forward_batch_split_prefill(batch, forward_times=forward_times)
+        batch.output_ids = next_token_ids
+        ret = logits_output, next_token_ids, batch.get_model_worker_batch().bid
+        return ret
 
     def process_batch_result(self, batch: ScheduleBatch, result):
         if batch.forward_mode.is_decode():
@@ -1199,7 +1237,7 @@ class Scheduler:
             logits_output, next_token_ids, bid = result
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid, batch.forward_mode.is_split_prefill())
             else:
                 # Move next_token_ids and logprobs to cpu
                 if batch.return_logprob:

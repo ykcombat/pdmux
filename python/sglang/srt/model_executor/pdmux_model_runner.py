@@ -47,12 +47,12 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.loader import EntireModelLoader, PDMuxDecodeModelLoader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
-    init_custom_process_group,
     is_hip,
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
@@ -62,7 +62,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 
-class ModelRunner:
+class PDMuxModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -159,8 +159,6 @@ class ModelRunner:
             self.torch_tp_applied = False
 
         # Init memory pool and attention backends
-        if server_args.lora_paths is not None:
-            self.init_lora_manager()
         self.init_memory_pool(
             min_per_gpu_memory,
             server_args.max_running_requests,
@@ -238,181 +236,29 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            load_way="entire_model"
         )
-
-        if self.server_args.load_format == "gguf":
-            monkey_patch_vllm_gguf_config()
-        self.model = get_model(
+        prefill_model_loader = EntireModelLoader(load_config=self.load_config)
+        self.prefill_model = prefill_model_loader.load_model(
             model_config=self.model_config,
-            load_config=self.load_config,
             device_config=DeviceConfig(self.device),
         )
-        print(self.model)
-
-        self.sliding_window_size = (
-            self.model.get_attention_sliding_window_size()
-            if hasattr(self.model, "get_attention_sliding_window_size")
-            else None
+        decode_model_loader = PDMuxDecodeModelLoader(load_config=self.load_config)
+        self.decode_model = decode_model_loader.load_model(
+            model_config=self.model_config,
+            device_config=DeviceConfig(self.device),
+            prefill_model=self.prefill_model
         )
+
+        self.sliding_window_size = None
         self.dtype = self.model_config.dtype
 
         logger.info(
             f"Load weight end. "
-            f"type={type(self.model).__name__}, "
+            f"type={type(self.prefill_model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
-
-    def update_weights_from_disk(self, model_path: str, load_format: str):
-        """Update engine weights online from disk."""
-        from sglang.srt.model_loader.loader import (
-            DefaultModelLoader,
-            device_loading_context,
-            get_model_loader,
-        )
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
-        logger.info(
-            f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
-
-        # Only support vllm DefaultModelLoader for now
-        loader = get_model_loader(load_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
-            return False, message
-
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source(
-                    config.model_path,
-                    revision=config.revision,
-                    fall_back_to_pt=getattr(
-                        self.model, "fall_back_to_pt_during_load", True
-                    ),
-                )
-            )
-            return iter
-
-        def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-            return model
-
-        with set_default_torch_dtype(self.model_config.dtype):
-            try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.model, iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
-                gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
-                return False, message
-
-        self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
-        self.load_config = load_config
-
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
-
-    def init_weights_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        """Initialize the Torch process group for model parameter updates.
-
-        `_model_update_group` is used in the RLHF workflow, where rank
-        0 is the actor model in the training engine, and the other ranks are
-        the inference engine, which is used for rollout.
-
-        In the RLHF workflow, the training engine updates the model
-        weights/parameters online, and broadcasts them to the inference
-        engine through the `_model_update_group` process group.
-        """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        rank = rank_offset + self.tp_rank
-
-        logger.info(
-            f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
-        )
-
-        try:
-            self._model_update_group = init_custom_process_group(
-                backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
-                world_size=world_size,
-                rank=rank,
-                group_name=group_name,
-            )
-            dist.barrier(group=self._model_update_group, device_ids=[rank])
-            return True, "Succeeded to initialize custom process group."
-        except Exception as e:
-            message = f"Failed to initialize custom process group: {e}."
-            logger.error(message)
-            return False, message
-
-    def update_weights_from_distributed(self, name, dtype, shape):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
-
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-        )
-        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
-
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
-        try:
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            self.model.load_weights([(name, weights)])
-            return True, f"Succeeded to update parameter {name} online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
@@ -424,23 +270,13 @@ class ModelRunner:
         """
         # TODO: (chenyang) Add support for Qwen models.
         try:
-            return self.model.get_weights_by_name(
+            return self.prefill_model.get_weights_by_name(
                 name, truncate_size, tp_size=self.tp_size
             )
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
-    def init_lora_manager(self):
-        self.lora_manager = LoRAManager(
-            base_model=self.model,
-            lora_paths=self.server_args.lora_paths,
-            base_hf_config=self.model_config.hf_config,
-            max_loras_per_batch=self.server_args.max_loras_per_batch,
-            load_config=self.load_config,
-            dtype=self.dtype,
-        )
-        logger.info("LoRA manager ready.")
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
@@ -627,7 +463,7 @@ class ModelRunner:
         from sglang.srt.model_parallel import tensor_parallel
 
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
-        tensor_parallel(self.model, device_mesh)
+        tensor_parallel(self.decode_model, device_mesh)
 
     def forward_decode(self, forward_batch: ForwardBatch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
@@ -635,7 +471,7 @@ class ModelRunner:
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
         self.attn_backend.init_forward_metadata(forward_batch)
-        return self.model.forward(
+        return self.decode_model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
@@ -643,11 +479,11 @@ class ModelRunner:
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             if forward_batch.input_embeds is None:
-                return self.model.forward(
+                return self.prefill_model.forward(
                     forward_batch.input_ids, forward_batch.positions, forward_batch
                 )
             else:
-                return self.model.forward(
+                return self.prefill_model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
@@ -655,7 +491,7 @@ class ModelRunner:
                 )
         else:
             # Only embedding models have get_embedding parameter
-            return self.model.forward(
+            return self.prefill_model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -664,7 +500,7 @@ class ModelRunner:
     
     def forward_split_prefill(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
-        ret = self.model.forward_split_prefill(
+        ret = self.prefill_model.forward_split_prefill(
             forward_batch.input_ids, forward_batch.positions, forward_batch, forward_batch.split_index, 
         )
         forward_batch.split_index = forward_batch.split_index + 1
@@ -674,7 +510,7 @@ class ModelRunner:
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)
 
-        return self.model.forward(
+        return self.prefill_model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 

@@ -530,6 +530,7 @@ class ScheduleBatch:
 
     # split prefill
     split_index: int = 0
+    split_max_index: int = 35
     split_forward_batch: ForwardBatch = None
     split_prefill_finished: bool = False
     split_prefill_seqlen: int = 0

@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch, ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.pdmux_model_runner import PDMuxModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, set_random_seed
 
@@ -59,15 +60,26 @@ class TpModelWorker:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
-        self.model_runner = ModelRunner(
-            model_config=self.model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            nccl_port=nccl_port,
-            server_args=server_args,
-        )
+        if server_args.pd_policy == "pdmux":
+            self.model_runner = PDMuxModelRunner(
+                model_config=self.model_config,
+                mem_fraction_static=server_args.mem_fraction_static,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                nccl_port=nccl_port,
+                server_args=server_args,
+            )
+        else:
+            self.model_runner = ModelRunner(
+                model_config=self.model_config,
+                mem_fraction_static=server_args.mem_fraction_static,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                nccl_port=nccl_port,
+                server_args=server_args,
+            )            
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -171,13 +183,11 @@ class TpModelWorker:
             schedule_batch.split_forward_batch = forward_batch
         logits_output = self.model_runner.forward(schedule_batch.split_forward_batch)
         next_token_ids = None
-        schedule_batch.split_index = schedule_batch.split_forward_batch.split_index
         if logits_output:
             schedule_batch.split_prefill_finished = True
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         return logits_output, next_token_ids
-        
-
+               
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
